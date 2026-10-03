@@ -53,20 +53,23 @@ const isUserMatch = (idA, idB) => {
   return cA.some((a) => cB.includes(a));
 };
 
-// Helper to send to a user using all candidate ID forms
+// Helper to send to a user using all candidate ID forms with socket deduplication
 const emitToUser = (targetUserId, event, payload) => {
   const candidateIds = getCandidateUserIds(targetUserId);
-  let delivered = false;
+  const targetSockets = new Set();
   for (const cid of candidateIds) {
     const sIds = userSockets.get(cid);
     if (sIds && sIds.size > 0) {
-      sIds.forEach((sid) => {
-        io.to(sid).emit(event, payload);
-      });
-      delivered = true;
+      sIds.forEach((sid) => targetSockets.add(sid));
     }
   }
-  return delivered;
+  if (targetSockets.size > 0) {
+    targetSockets.forEach((sid) => {
+      io.to(sid).emit(event, payload);
+    });
+    return true;
+  }
+  return false;
 };
 
 // In-memory stream history (seed data + completed streams)
@@ -152,6 +155,32 @@ app.get('/api/live/active/:hostId', (req, res) => {
   return res.json({ success: true, activeStream: null });
 });
 
+// Check All Active Live Rooms & Hosts for Reconciliation
+app.get('/api/live/active-rooms', (req, res) => {
+  const rooms = [];
+  const activeHostIds = [];
+  for (const [roomId, room] of activeLiveRooms.entries()) {
+    const isHostOnline = Boolean(room.hostSocketId && io.sockets.sockets.has(room.hostSocketId));
+    rooms.push({
+      roomId,
+      hostUserId: String(room.hostUserId),
+      isHostOnline,
+      viewersCount: room.viewers ? room.viewers.size : 0,
+      title: room.info?.title || 'Live Broadcast',
+      category: room.info?.category || 'Acoustic & Chill',
+    });
+    if (room.hostUserId) {
+      activeHostIds.push(String(room.hostUserId));
+    }
+  }
+  return res.json({
+    success: true,
+    count: rooms.length,
+    rooms,
+    activeHostIds,
+  });
+});
+
 // Stream Termination Helper
 const handleEndLiveStream = (data) => {
   const roomId = String(data?.roomId || data?.room_id || data?.streamId || '');
@@ -218,6 +247,39 @@ const handleEndLiveStream = (data) => {
   // Broadcast globally so all discovery cards in user apps are removed immediately!
   io.emit('stream:ended', { roomId, streamId: roomId, hostId });
   io.emit('stream:ended_global', { roomId, streamId: roomId, hostId });
+  io.emit('live_stream_ended', { roomId, streamId: roomId, hostId });
+
+  // Call Laravel API to update MySQL LiveRoom and Host table
+  try {
+    const postData = JSON.stringify({
+      room_id: roomId,
+      host_id: hostId,
+      duration_seconds: durationSeconds,
+      coins_earned: coinsEarned,
+      end_reason: data?.end_reason || 'socket_sync',
+    });
+    const req = http.request(
+      'http://127.0.0.1/projects/irshad/jodiiclub/api/v1/live/end-room',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData),
+        },
+        timeout: 3000,
+      },
+      (laravelRes) => {
+        // success
+      }
+    );
+    req.on('error', (e) => {
+      console.warn('[handleEndLiveStream] Failed to notify Laravel end-room:', e.message);
+    });
+    req.write(postData);
+    req.end();
+  } catch (err) {
+    console.warn('[handleEndLiveStream] Error calling Laravel end-room:', err);
+  }
 };
 
 // REST endpoints to terminate an active live stream
@@ -306,35 +368,19 @@ io.on('connection', (socket) => {
     socket.emit('registered', { success: true, userId });
     socket.broadcast.emit('user:online_status', { userId, isOnline: true });
 
-    // Check activeCalls: Deliver queued calls or ended notifications
+    // Check activeCalls: Deliver queued calls to newly registered receiver
     for (const [cId, call] of activeCalls.entries()) {
-      if (isUserMatch(call.callerId, userId) || isUserMatch(call.receiverId, userId)) {
-        if (call.status === 'ended' || call.status === 'rejected') {
-          if (!call.endedAt || Date.now() - call.endedAt < 600000) {
-            console.log(`[Register] Delivering call_ended to reconnected user ${userId} for call ${cId}`);
-            socket.emit('call_ended', {
-              callId: call.callId,
-              endedBy: call.endedBy || 'remote',
-              reason: call.reason || 'Call ended',
-            });
-            socket.emit('call:ended', {
-              callId: call.callId,
-              endedBy: call.endedBy || 'remote',
-              reason: call.reason || 'Call ended',
-            });
-          }
-        } else if (call.status === 'ringing' && isUserMatch(call.receiverId, userId)) {
-          if (Date.now() - call.startedAt < 35000) {
-            console.log(`[Register] Delivering queued incoming_call to newly registered receiver ${userId} for call ${cId}`);
-            const incomingPayload = {
-              callId: call.callId,
-              sessionId: call.sessionId,
-              callType: call.callType || 'video',
-              caller: call.caller,
-            };
-            socket.emit('incoming_call', incomingPayload);
-            socket.emit('call:incoming', incomingPayload);
-          }
+      if (call.status === 'ringing' && isUserMatch(call.receiverId, userId)) {
+        if (Date.now() - call.startedAt < 35000) {
+          console.log(`[Register] Delivering queued incoming_call to newly registered receiver ${userId} for call ${cId}`);
+          const incomingPayload = {
+            callId: call.callId,
+            sessionId: call.sessionId,
+            callType: call.callType || 'video',
+            caller: call.caller,
+          };
+          socket.emit('incoming_call', incomingPayload);
+          socket.emit('call:incoming', incomingPayload);
         }
       }
     }
@@ -408,13 +454,10 @@ io.on('connection', (socket) => {
       acceptedBy: socketUsers.get(socket.id)?.userId || payload.acceptedBy,
     };
 
-    if (targetId) {
-      emitToUser(targetId, 'call_accepted', acceptPayload);
-      emitToUser(targetId, 'call:accepted', acceptPayload);
-    }
-    if (call) {
-      emitToUser(call.callerId, 'call_accepted', acceptPayload);
-      emitToUser(call.callerId, 'call:accepted', acceptPayload);
+    const recipient = targetId || (call ? call.callerId : null);
+    if (recipient) {
+      emitToUser(recipient, 'call_accepted', acceptPayload);
+      emitToUser(recipient, 'call:accepted', acceptPayload);
     }
   });
   socket.on('call:accept', (payload) => {
@@ -429,9 +472,10 @@ io.on('connection', (socket) => {
       callId,
       acceptedBy: socketUsers.get(socket.id)?.userId || payload.acceptedBy,
     };
-    if (targetId) {
-      emitToUser(targetId, 'call_accepted', acceptPayload);
-      emitToUser(targetId, 'call:accepted', acceptPayload);
+    const recipient = targetId || (call ? call.callerId : null);
+    if (recipient) {
+      emitToUser(recipient, 'call_accepted', acceptPayload);
+      emitToUser(recipient, 'call:accepted', acceptPayload);
     }
   });
 
@@ -446,6 +490,11 @@ io.on('connection', (socket) => {
       call.endedBy = payload.endedBy || 'host';
       call.reason = payload.reason || 'Call rejected';
       call.endedAt = Date.now();
+      setTimeout(() => {
+        if (activeCalls.get(callId)?.status === 'rejected') {
+          activeCalls.delete(callId);
+        }
+      }, 5000);
     }
 
     const rejData = {
@@ -453,13 +502,11 @@ io.on('connection', (socket) => {
       reason: payload.reason || 'Call rejected',
       endedBy: payload.endedBy || 'host',
     };
-    if (targetUserId) {
-      emitToUser(targetUserId, 'call_rejected', rejData);
-      emitToUser(targetUserId, 'call:rejected', rejData);
-    }
-    if (call) {
-      emitToUser(call.callerId, 'call_rejected', rejData);
-      emitToUser(call.callerId, 'call:rejected', rejData);
+
+    const recipient = targetUserId || (call ? call.callerId : null);
+    if (recipient) {
+      emitToUser(recipient, 'call_rejected', rejData);
+      emitToUser(recipient, 'call:rejected', rejData);
     }
   });
   socket.on('call:reject', (payload) => {
@@ -471,15 +518,21 @@ io.on('connection', (socket) => {
       call.endedBy = payload.endedBy || 'host';
       call.reason = payload.reason || 'Call rejected';
       call.endedAt = Date.now();
+      setTimeout(() => {
+        if (activeCalls.get(callId)?.status === 'rejected') {
+          activeCalls.delete(callId);
+        }
+      }, 5000);
     }
     const rejData = {
       callId,
       reason: payload.reason || 'Call rejected',
       endedBy: payload.endedBy || 'host',
     };
-    if (targetUserId) {
-      emitToUser(targetUserId, 'call_rejected', rejData);
-      emitToUser(targetUserId, 'call:rejected', rejData);
+    const recipient = targetUserId || (call ? call.callerId : null);
+    if (recipient) {
+      emitToUser(recipient, 'call_rejected', rejData);
+      emitToUser(recipient, 'call:rejected', rejData);
     }
   });
 
@@ -505,6 +558,11 @@ io.on('connection', (socket) => {
       call.endedBy = endedBy;
       call.reason = reason;
       call.endedAt = Date.now();
+      setTimeout(() => {
+        if (activeCalls.get(callId)?.status === 'ended') {
+          activeCalls.delete(callId);
+        }
+      }, 5000);
     }
 
     const endPayload = {
@@ -513,15 +571,10 @@ io.on('connection', (socket) => {
       reason,
     };
 
-    if (targetUserId) {
-      emitToUser(targetUserId, 'call_ended', endPayload);
-      emitToUser(targetUserId, 'call:ended', endPayload);
-    }
-    if (call) {
-      emitToUser(call.callerId, 'call_ended', endPayload);
-      emitToUser(call.callerId, 'call:ended', endPayload);
-      emitToUser(call.receiverId, 'call_ended', endPayload);
-      emitToUser(call.receiverId, 'call:ended', endPayload);
+    const recipient = targetUserId || (call ? (isUserMatch(call.callerId, sender?.userId) ? call.receiverId : call.callerId) : null);
+    if (recipient) {
+      emitToUser(recipient, 'call_ended', endPayload);
+      emitToUser(recipient, 'call:ended', endPayload);
     }
   };
   socket.on('call_end', handleCallEnd);
@@ -567,7 +620,7 @@ io.on('connection', (socket) => {
   socket.on('call:gift', handleCallGift);
 
   // WebRTC 1-on-1 SDP Offer / Answer / ICE
-  socket.on('webrtc_offer', (payload) => {
+  const handleWebRtcOffer = (payload) => {
     const sender = socketUsers.get(socket.id);
     const targetUserId = payload.targetUserId || payload.toUserId || payload.remoteUserId;
     console.log(`[WebRTC 1-on-1 Offer] From ${sender?.userId} to ${targetUserId}`);
@@ -577,21 +630,11 @@ io.on('connection', (socket) => {
       callId: payload.callId,
     };
     emitToUser(targetUserId, 'webrtc_offer', data);
-    emitToUser(targetUserId, 'webrtc:offer', data);
-  });
-  socket.on('webrtc:offer', (payload) => {
-    const sender = socketUsers.get(socket.id);
-    const targetUserId = payload.targetUserId || payload.toUserId || payload.remoteUserId;
-    const data = {
-      offer: payload.offer,
-      fromUserId: sender ? sender.userId : payload.fromUserId,
-      callId: payload.callId,
-    };
-    emitToUser(targetUserId, 'webrtc_offer', data);
-    emitToUser(targetUserId, 'webrtc:offer', data);
-  });
+  };
+  socket.on('webrtc_offer', handleWebRtcOffer);
+  socket.on('webrtc:offer', handleWebRtcOffer);
 
-  socket.on('webrtc_answer', (payload) => {
+  const handleWebRtcAnswer = (payload) => {
     const sender = socketUsers.get(socket.id);
     const targetUserId = payload.targetUserId || payload.toUserId || payload.remoteUserId;
     console.log(`[WebRTC 1-on-1 Answer] From ${sender?.userId} to ${targetUserId}`);
@@ -601,21 +644,11 @@ io.on('connection', (socket) => {
       callId: payload.callId,
     };
     emitToUser(targetUserId, 'webrtc_answer', data);
-    emitToUser(targetUserId, 'webrtc:answer', data);
-  });
-  socket.on('webrtc:answer', (payload) => {
-    const sender = socketUsers.get(socket.id);
-    const targetUserId = payload.targetUserId || payload.toUserId || payload.remoteUserId;
-    const data = {
-      answer: payload.answer,
-      fromUserId: sender ? sender.userId : payload.fromUserId,
-      callId: payload.callId,
-    };
-    emitToUser(targetUserId, 'webrtc_answer', data);
-    emitToUser(targetUserId, 'webrtc:answer', data);
-  });
+  };
+  socket.on('webrtc_answer', handleWebRtcAnswer);
+  socket.on('webrtc:answer', handleWebRtcAnswer);
 
-  socket.on('webrtc_ice_candidate', (payload) => {
+  const handleWebRtcIce = (payload) => {
     const sender = socketUsers.get(socket.id);
     const targetUserId = payload.targetUserId || payload.toUserId || payload.remoteUserId;
     const data = {
@@ -624,19 +657,9 @@ io.on('connection', (socket) => {
       callId: payload.callId,
     };
     emitToUser(targetUserId, 'webrtc_ice_candidate', data);
-    emitToUser(targetUserId, 'webrtc:ice_candidate', data);
-  });
-  socket.on('webrtc:ice_candidate', (payload) => {
-    const sender = socketUsers.get(socket.id);
-    const targetUserId = payload.targetUserId || payload.toUserId || payload.remoteUserId;
-    const data = {
-      candidate: payload.candidate,
-      fromUserId: sender ? sender.userId : payload.fromUserId,
-      callId: payload.callId,
-    };
-    emitToUser(targetUserId, 'webrtc_ice_candidate', data);
-    emitToUser(targetUserId, 'webrtc:ice_candidate', data);
-  });
+  };
+  socket.on('webrtc_ice_candidate', handleWebRtcIce);
+  socket.on('webrtc:ice_candidate', handleWebRtcIce);
 
   // Backward compatibility: webrtc_signal
   socket.on('webrtc_signal', (payload) => {
@@ -694,8 +717,23 @@ io.on('connection', (socket) => {
     });
     console.log(`[Live Stream] Host went live in room: ${roomId} (Socket: ${socket.id})`);
     
-    io.emit('live_stream_started', { roomId, ...data });
-    socket.broadcast.emit('host:live_alert', data);
+    const liveAlertPayload = {
+      roomId,
+      streamId: roomId,
+      hostId: String(data.hostId),
+      hostName: data.hostName || 'Live Host',
+      avatar: data.avatar || data.hostAvatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=800&q=80',
+      coverImage: data.coverImage || data.avatar || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=800&q=80',
+      title: data.title || 'Live Broadcast',
+      category: data.category || 'Live Lounge',
+      viewersCount: 1,
+      tags: data.tags || ['#Live', '#Official'],
+      startedAt: new Date().toISOString(),
+      ...data,
+    };
+    io.emit('live_stream_started', liveAlertPayload);
+    socket.broadcast.emit('host:live_alert', liveAlertPayload);
+    io.emit('host:went_live_broadcast', liveAlertPayload);
 
     // If viewers joined before host:went_live, tell host to initiate WebRTC for each
     existingViewers.forEach((viewerSocketId) => {
@@ -1071,7 +1109,7 @@ io.on('connection', (socket) => {
     // Check if disconnected socket was a host of an active live room
     for (const [roomId, room] of activeLiveRooms.entries()) {
       if (room.hostSocketId === socket.id) {
-        console.log(`[Socket] Host ${room.hostUserId} disconnected temporarily from room ${roomId}. Waiting 5m grace period...`);
+        console.log(`[Socket] Host ${room.hostUserId} disconnected from room ${roomId}. Waiting 15s grace period...`);
         room.hostSocketId = null;
 
         if (roomDisconnectTimeouts.has(roomId)) {
@@ -1080,8 +1118,8 @@ io.on('connection', (socket) => {
 
         const timer = setTimeout(() => {
           console.log(`[Socket] Grace period expired for room ${roomId}. Host did not reconnect. Ending stream.`);
-          handleEndLiveStream({ roomId, hostId: room.hostUserId });
-        }, 300000); // 5 minutes grace period
+          handleEndLiveStream({ roomId, hostId: room.hostUserId, end_reason: 'host_offline' });
+        }, 15000); // 15 seconds grace period
 
         roomDisconnectTimeouts.set(roomId, timer);
       } else if (room.viewers.has(socket.id)) {
