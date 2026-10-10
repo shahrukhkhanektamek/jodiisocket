@@ -40,8 +40,18 @@ const getCandidateUserIds = (id) => {
   const set = new Set([raw]);
   if (raw.startsWith('host_')) {
     set.add(raw.replace(/^host_/, ''));
+  } else if (raw.startsWith('user_')) {
+    set.add(raw.replace(/^user_/, ''));
   } else if (/^\d+$/.test(raw)) {
     set.add(`host_${raw}`);
+    set.add(`user_${raw}`);
+  }
+  // Also extract numeric ID if prefixed like conv_5_123 or temp_5_123 or user_5
+  const prefixMatch = raw.match(/^(?:conv|temp|user|host)_(\d+)/);
+  if (prefixMatch && prefixMatch[1]) {
+    set.add(prefixMatch[1]);
+    set.add(`host_${prefixMatch[1]}`);
+    set.add(`user_${prefixMatch[1]}`);
   }
   return Array.from(set);
 };
@@ -388,6 +398,15 @@ io.on('connection', (socket) => {
 
   socket.on('register_user', handleUserRegister);
   socket.on('user:register', handleUserRegister);
+
+  socket.on('set_online_status', (data) => {
+    if (!data) return;
+    const targetUserId = String(data.userId || data.hostId || '');
+    if (!targetUserId) return;
+    const isOnline = Boolean(data.isOnline);
+    console.log(`[Online Status Changed] User/Host ${targetUserId} -> ${isOnline ? 'ONLINE' : 'OFFLINE'}`);
+    io.emit('user:online_status', { userId: targetUserId, hostId: targetUserId, isOnline });
+  });
 
   // ==================== 1-ON-1 CALL SIGNALING ====================
 
@@ -1067,16 +1086,146 @@ io.on('connection', (socket) => {
   socket.on('party_speaking', handlePartySpeaking);
   socket.on('party:mic_speaking', handlePartySpeaking);
 
-  // ==================== CHAT MESSAGES ====================
+  // ==================== CHAT MESSAGES & ROOMS ====================
+  socket.on('chat:join', (data) => {
+    if (!data) return;
+    const convId = String(data.conversationId || data.convId || '');
+    if (convId) {
+      socket.join(`chat_${convId}`);
+      console.log(`[Chat Room Join] Socket ${socket.id} joined chat_${convId}`);
+      const numMatch = convId.match(/\d+/);
+      if (numMatch && numMatch[0]) {
+        socket.join(`chat_conv_${numMatch[0]}`);
+      }
+    }
+  });
+
+  socket.on('chat:leave', (data) => {
+    if (!data) return;
+    const convId = String(data.conversationId || data.convId || '');
+    if (convId) {
+      socket.leave(`chat_${convId}`);
+      const numMatch = convId.match(/\d+/);
+      if (numMatch && numMatch[0]) {
+        socket.leave(`chat_conv_${numMatch[0]}`);
+      }
+    }
+  });
+
   const handleChatMessage = (msg) => {
-    const receiverId = String(msg.receiverId || msg.recipientId || msg.toUserId);
-    console.log(`[Chat Message] From ${msg.senderId} to ${receiverId}`);
-    emitToUser(receiverId, 'new_message', msg);
-    emitToUser(receiverId, 'chat:receive_message', msg);
+    if (!msg) return;
+    const receiverId = String(msg.receiverId || msg.recipientId || msg.toUserId || '');
+    const convId = String(msg.conversationId || '');
+    console.log(`[Chat Message] From ${msg.senderId} to ${receiverId} (Conv: ${convId}, Type: ${msg.type})`);
+    if (!msg.id) {
+      msg.id = 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+    }
+    if (!msg.clientMsgId) {
+      msg.clientMsgId = msg.id;
+    }
+
+    const deliveredSockets = new Set();
+    deliveredSockets.add(socket.id); // Never echo back to sender socket
+
+    const sendMsgToSocket = (sid) => {
+      if (!deliveredSockets.has(sid)) {
+        deliveredSockets.add(sid);
+        io.to(sid).emit('new_message', msg);
+      }
+    };
+
+    // 1. Deliver directly to receiver's registered sockets
+    if (receiverId) {
+      const candidates = getCandidateUserIds(receiverId);
+      for (const cid of candidates) {
+        const sIds = userSockets.get(cid);
+        if (sIds) sIds.forEach(sendMsgToSocket);
+      }
+    }
+
+    // 2. Deliver to user extracted from temporary convId like conv_5_123 or temp_5_123
+    if (convId) {
+      const match = convId.match(/^(?:conv|temp)_(\d+)_/);
+      if (match && match[1]) {
+        const candidates = getCandidateUserIds(match[1]);
+        for (const cid of candidates) {
+          const sIds = userSockets.get(cid);
+          if (sIds) sIds.forEach(sendMsgToSocket);
+        }
+      }
+      // Deliver to chat room participants (excluding already delivered sockets & sender)
+      const roomClients = io.sockets.adapter.rooms.get(`chat_${convId}`);
+      if (roomClients) roomClients.forEach(sendMsgToSocket);
+      const numMatch = convId.match(/\d+/);
+      if (numMatch && numMatch[0]) {
+        const convRoomClients = io.sockets.adapter.rooms.get(`chat_conv_${numMatch[0]}`);
+        if (convRoomClients) convRoomClients.forEach(sendMsgToSocket);
+      }
+    }
+
     socket.emit('message_sent', { messageId: msg.id, status: 'delivered' });
   };
   socket.on('chat_message', handleChatMessage);
   socket.on('chat:send_message', handleChatMessage);
+
+  socket.on('chat:send_gift', (payload) => {
+    if (!payload) return;
+    const receiverId = String(payload.receiverId || payload.recipientId || payload.toUserId || '');
+    const convId = String(payload.conversationId || '');
+    console.log(`[Chat Gift Sent] From ${payload.senderId} to ${receiverId}: ${payload.gift?.name || payload.giftName}`);
+    const giftId = payload.id || ('gift_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7));
+    payload.id = giftId;
+    payload.clientMsgId = payload.clientMsgId || giftId;
+    const giftMsg = {
+      id: giftId,
+      clientMsgId: payload.clientMsgId || giftId,
+      conversationId: payload.conversationId,
+      senderId: String(payload.senderId),
+      senderName: payload.senderName || 'Sender',
+      text: payload.text || `🎁 Sent ${payload.gift?.name || payload.giftName}`,
+      type: 'gift',
+      gift: payload.gift,
+      giftName: payload.gift?.name || payload.giftName,
+      coins: payload.coins || payload.gift?.coins,
+      timestamp: 'Just now',
+    };
+
+    const deliveredSockets = new Set();
+    deliveredSockets.add(socket.id); // Never echo back to sender socket
+
+    const sendGiftToSocket = (sid) => {
+      if (!deliveredSockets.has(sid)) {
+        deliveredSockets.add(sid);
+        io.to(sid).emit('chat_gift_received', payload);
+        io.to(sid).emit('new_message', giftMsg);
+      }
+    };
+
+    if (receiverId) {
+      const candidates = getCandidateUserIds(receiverId);
+      for (const cid of candidates) {
+        const sIds = userSockets.get(cid);
+        if (sIds) sIds.forEach(sendGiftToSocket);
+      }
+    }
+    if (convId) {
+      const match = convId.match(/^(?:conv|temp)_(\d+)_/);
+      if (match && match[1]) {
+        const candidates = getCandidateUserIds(match[1]);
+        for (const cid of candidates) {
+          const sIds = userSockets.get(cid);
+          if (sIds) sIds.forEach(sendGiftToSocket);
+        }
+      }
+      const roomClients = io.sockets.adapter.rooms.get(`chat_${convId}`);
+      if (roomClients) roomClients.forEach(sendGiftToSocket);
+      const numMatch = convId.match(/\d+/);
+      if (numMatch && numMatch[0]) {
+        const convRoomClients = io.sockets.adapter.rooms.get(`chat_conv_${numMatch[0]}`);
+        if (convRoomClients) convRoomClients.forEach(sendGiftToSocket);
+      }
+    }
+  });
 
   const handleTyping = (data) => {
     const receiverId = String(data.receiverId || data.recipientId || data.toUserId);
