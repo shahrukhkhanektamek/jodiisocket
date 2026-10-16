@@ -827,10 +827,24 @@ io.on('connection', (socket) => {
       user: data.user,
       count: room.viewers.size,
     });
+    if (room.filter) {
+      socket.emit('stream:filter_changed', room.filter);
+    }
     console.log(`[Live Stream] Viewer ${socket.id} joined room ${roomId}. Total: ${room.viewers.size}`);
   });
   socket.on('stream:join', (data) => {
     socket.emit('join_live', data);
+  });
+
+  socket.on('host:update_filter', (data) => {
+    const roomId = String(data.roomId || data.streamId);
+    let room = activeLiveRooms.get(roomId);
+    if (room) {
+      room.filter = data;
+    }
+    socket.to(roomId).emit('stream:filter_changed', data);
+    socket.to(`stream_${roomId}`).emit('stream:filter_changed', data);
+    console.log(`[Live Stream] Host updated filter in room ${roomId}:`, data.filterId);
   });
 
   socket.on('leave_live', (data) => {
