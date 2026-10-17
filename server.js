@@ -88,8 +88,7 @@ const streamHistory = [
     id: 'sh_seed_1',
     roomId: 'room_live_seed_1',
     hostId: '1',
-    title: 'Late Night Acoustic Vibes & Chill',
-    category: 'Acoustic & Chill',
+    title: 'Late Night Live Stream',
     durationSeconds: 2740,
     coinsEarned: 1850,
     peakViewers: 28,
@@ -106,7 +105,6 @@ const streamHistory = [
     roomId: 'room_live_seed_2',
     hostId: '1',
     title: 'Weekend Special Q&A with Fans',
-    category: 'Conversations',
     durationSeconds: 3600,
     coinsEarned: 2400,
     peakViewers: 34,
@@ -154,7 +152,6 @@ app.get('/api/live/active/:hostId', (req, res) => {
         activeStream: {
           roomId,
           title: room.info?.title || 'Live Broadcast',
-          category: room.info?.category || 'Acoustic & Chill',
           startedAt: room.info?.startedAt || Date.now(),
           viewersCount: room.viewers ? room.viewers.size : 0,
           duration: room.duration || room.info?.duration || 0,
@@ -177,7 +174,6 @@ app.get('/api/live/active-rooms', (req, res) => {
       isHostOnline,
       viewersCount: room.viewers ? room.viewers.size : 0,
       title: room.info?.title || 'Live Broadcast',
-      category: room.info?.category || 'Acoustic & Chill',
     });
     if (room.hostUserId) {
       activeHostIds.push(String(room.hostUserId));
@@ -212,7 +208,6 @@ const handleEndLiveStream = (data) => {
       roomId,
       hostId: hostId || room.hostUserId || '1',
       title: room.info?.title || 'Live Broadcast',
-      category: room.info?.category || 'Acoustic & Chill',
       durationSeconds: durationSeconds,
       coinsEarned: coinsEarned,
       peakViewers: room.viewersHistory ? room.viewersHistory.size : (room.viewers ? room.viewers.size : 1),
@@ -228,7 +223,6 @@ const handleEndLiveStream = (data) => {
       roomId,
       hostId: hostId || '1',
       title: 'Live Broadcast',
-      category: 'Acoustic & Chill',
       durationSeconds: durationSeconds,
       coinsEarned: coinsEarned,
       peakViewers: 1,
@@ -322,7 +316,6 @@ app.get('/api/host/dashboard/:hostId', (req, res) => {
       activeStream = {
         roomId,
         title: room.info?.title || 'Live Broadcast',
-        category: room.info?.category || 'Acoustic & Chill',
         startedAt: room.info?.startedAt || Date.now(),
         viewersCount: room.viewers ? room.viewers.size : 0,
         duration: room.duration || room.info?.duration || 0,
@@ -374,9 +367,28 @@ io.on('connection', (socket) => {
       userSockets.get(cid).add(socket.id);
     });
 
-    console.log(`[User Registered] User ${userId} (keys: ${candidateIds.join(', ')}) mapped to socket ${socket.id}`);
-    socket.emit('registered', { success: true, userId });
-    socket.broadcast.emit('user:online_status', { userId, isOnline: true });
+    const isOnline = (data.isOnline !== undefined || data.is_online !== undefined)
+      ? Boolean(data.isOnline ?? data.is_online)
+      : true;
+
+    console.log(`[User Registered] User ${userId} (keys: ${candidateIds.join(', ')}) mapped to socket ${socket.id}, isOnline: ${isOnline}`);
+    socket.emit('registered', { success: true, userId, isOnline });
+    socket.broadcast.emit('user:online_status', {
+      userId,
+      hostId: userId,
+      candidateIds,
+      isOnline,
+      is_online: isOnline,
+      name: data.name,
+    });
+    socket.broadcast.emit('host_status_change', {
+      userId,
+      hostId: userId,
+      candidateIds,
+      isOnline,
+      is_online: isOnline,
+      name: data.name,
+    });
 
     // Check activeCalls: Deliver queued calls to newly registered receiver
     for (const [cId, call] of activeCalls.entries()) {
@@ -403,9 +415,51 @@ io.on('connection', (socket) => {
     if (!data) return;
     const targetUserId = String(data.userId || data.hostId || '');
     if (!targetUserId) return;
-    const isOnline = Boolean(data.isOnline);
-    console.log(`[Online Status Changed] User/Host ${targetUserId} -> ${isOnline ? 'ONLINE' : 'OFFLINE'}`);
-    io.emit('user:online_status', { userId: targetUserId, hostId: targetUserId, isOnline });
+    const isOnline = Boolean(data.isOnline ?? data.is_online);
+    const candidateIds = getCandidateUserIds(targetUserId);
+    console.log(`[Online Status Changed] User/Host ${targetUserId} (keys: ${candidateIds.join(', ')}) -> ${isOnline ? 'ONLINE' : 'OFFLINE'}`);
+    io.emit('user:online_status', {
+      userId: targetUserId,
+      hostId: targetUserId,
+      candidateIds,
+      isOnline,
+      is_online: isOnline,
+      name: data.name,
+    });
+    io.emit('host_status_change', {
+      userId: targetUserId,
+      hostId: targetUserId,
+      candidateIds,
+      isOnline,
+      is_online: isOnline,
+      name: data.name,
+      allowVoiceCalls: data.allowVoiceCalls,
+      allowVideoCalls: data.allowVideoCalls,
+    });
+  });
+
+  socket.on('host_status_change', (data) => {
+    if (!data) return;
+    const targetUserId = String(data.userId || data.hostId || '');
+    const candidateIds = targetUserId ? getCandidateUserIds(targetUserId) : [];
+    const isOnline = (data.isOnline !== undefined || data.is_online !== undefined)
+      ? Boolean(data.isOnline ?? data.is_online)
+      : undefined;
+    io.emit('host_status_change', {
+      ...data,
+      ...(isOnline !== undefined ? { isOnline, is_online: isOnline } : {}),
+      candidateIds,
+    });
+    if (isOnline !== undefined) {
+      io.emit('user:online_status', {
+        userId: targetUserId,
+        hostId: targetUserId,
+        candidateIds,
+        isOnline,
+        is_online: isOnline,
+        name: data.name,
+      });
+    }
   });
 
   // ==================== 1-ON-1 CALL SIGNALING ====================
@@ -1266,7 +1320,25 @@ io.on('connection', (socket) => {
         }
       });
       socketUsers.delete(socket.id);
-      socket.broadcast.emit('user:online_status', { userId: uInfo.userId, isOnline: false });
+      const isStillConnected = userSockets.has(uInfo.userId) && userSockets.get(uInfo.userId).size > 0;
+      if (!isStillConnected) {
+        socket.broadcast.emit('user:online_status', {
+          userId: uInfo.userId,
+          hostId: uInfo.userId,
+          candidateIds,
+          name: uInfo.name,
+          isOnline: false,
+          is_online: false,
+        });
+        socket.broadcast.emit('host_status_change', {
+          userId: uInfo.userId,
+          hostId: uInfo.userId,
+          candidateIds,
+          name: uInfo.name,
+          isOnline: false,
+          is_online: false,
+        });
+      }
     }
 
     // Check if disconnected socket was a host of an active live room
